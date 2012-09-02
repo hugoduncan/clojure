@@ -637,7 +637,136 @@
      (-reset-methods ~name)
      '~name)))
 
-(defmacro defprotocol 
+;;; These are from clojure.reflect.java
+(defn typename* [s]
+  (condp #(instance? %1 %2) s
+    clojure.lang.Symbol (.replace (str s) "<>" "[]")
+    ;; neither .getName not .getSimpleName returns the right thing, so best to
+    ;; delegate to Type
+    Class (typename* (clojure.asm.Type/getType s))
+    clojure.asm.Type (.getClassName s)))
+
+(defn- typesym*
+  "Given a typeref, create a legal Clojure symbol version of the
+   type's name."
+  [t]
+  (-> (typename* t)
+      (.replace "[]" "<>")
+      (symbol)))
+
+(defn- access-flag*
+  [[name flag & contexts]]
+  {:name name :flag flag :contexts (set (map keyword contexts))})
+
+(def ^{:doc "The Java access bitflags, along with their friendly names and
+the kinds of objects to which they can apply."}
+  flag-descriptors*
+  (vec
+   (map access-flag*
+        [[:public 0x0001 :class :field :method]
+         [:private 0x002 :class :field :method]
+         [:protected 0x0004  :class :field :method]
+         [:static 0x0008  :field :method]
+         [:final 0x0010  :class :field :method]
+         ;; :super is ancient history and is unfindable (?) by
+         ;; reflection. skip it
+         #_[:super 0x0020  :class]
+         [:synchronized 0x0020  :method]
+         [:volatile 0x0040  :field]
+         [:bridge 0x0040  :method]
+         [:varargs 0x0080  :method]
+         [:transient 0x0080  :field]
+         [:native 0x0100  :method]
+         [:interface 0x0200  :class]
+         [:abstract 0x0400  :class :method]
+         [:strict 0x0800  :method]
+         [:synthetic 0x1000  :class :field :method]
+         [:annotation 0x2000  :class]
+         [:enum 0x4000  :class :field :inner]])))
+
+(defn- parse-flags*
+  "Convert reflection bitflags into a set of keywords."
+  [flags context]
+  (reduce1
+   (fn [result fd]
+     (if (and (get (:contexts fd) context)
+              (not (zero? (bit-and flags (:flag fd)))))
+       (conj result (:name fd))
+       result))
+   #{}
+   flag-descriptors*))
+
+(defn- method->map*
+  [^java.lang.reflect.Method method]
+  {:name (symbol (.getName method))
+   :return-type (typesym* (.getReturnType method))
+   :declaring-class (typesym* (.getDeclaringClass method))
+   :parameter-types (vec (map typesym* (.getParameterTypes method)))
+   :exception-types (vec (map typesym* (.getExceptionTypes method)))
+   :flags (parse-flags* (.getModifiers method) :method)})
+
+(defn- emit-protocol-for-interface [name opts+sigs]
+  (let [doc (when (string? (first opts+sigs)) (first opts+sigs))
+        interface (if (string? (first opts+sigs))
+                            (second opts+sigs)
+                            (first opts+sigs))
+        iname interface
+        opts {}
+        methods (map
+                 method->map*
+                 (.getDeclaredMethods
+                  (clojure.lang.RT/loadClassForName (pr-str interface))))
+        opts {:on (list 'quote iname) :on-interface iname}
+        opts (if doc (assoc opts :doc doc) opts)
+        sigs (reduce1
+              (fn [m method]
+                (update-in
+                 m
+                 [(keyword (:name method))]
+                 (fn [sig]
+                   (if (some
+                        #(= (count (:parameter-types method)) (count %))
+                        (:arglists sig))
+                     (throw (Exception. "Overloaded arity"))
+                     (->
+                      {:name (:name method)
+                       :arglists []}
+                      (merge sig)
+                      (update-in
+                       [:arglists]
+                       (fn [args]
+                         (conj (or args [])
+                               (vec (concat ['this]
+                                            (:parameter-types method)))))))))))
+              {}
+              methods)]
+    `(do
+       (defonce ~name {})
+       (alter-meta! (var ~name) assoc :doc ~(:doc opts))
+       ~(when sigs
+          `(#'assert-same-protocol (var ~name) '~(map :name (vals sigs))))
+       (alter-var-root (var ~name) merge
+                       (assoc ~opts
+                         :sigs '~sigs
+                         :var (var ~name)
+                         :method-map
+                         ~(and (:on opts)
+                               (apply hash-map
+                                      (mapcat
+                                       (fn [s]
+                                         [(keyword (:name s)) (keyword (or (:on s) (:name s)))])
+                                       (vals sigs))))
+                         :method-builders
+                         ~(apply hash-map
+                                 (mapcat
+                                  (fn [s]
+                                    [`(intern *ns* (with-meta '~(:name s) (merge '~s {:protocol (var ~name)})))
+                                     (emit-method-builder (:on-interface opts) (:name s) (:on s) (:arglists s))])
+                                  (vals sigs)))))
+       (-reset-methods ~name)
+       '~name)))
+
+(defmacro defprotocol
   "A protocol is a named set of named methods and their signatures:
   (defprotocol AProtocolName
 
@@ -691,7 +820,17 @@
   [name & opts+sigs]
   (emit-protocol name opts+sigs))
 
-(defn extend 
+(defmacro defprotocol-from-interface
+  "Define a protocol based on an existing interface:
+  (defprotocol-from-interface AProtocolName some.Interface
+
+    ;optional doc string
+    \"A doc string for AProtocol abstraction\")"
+  {:added "1.5"}
+  [name & interface]
+  (emit-protocol-for-interface name interface))
+
+(defn extend
   "Implementations of protocol methods can be provided using the extend construct:
 
   (extend AType
