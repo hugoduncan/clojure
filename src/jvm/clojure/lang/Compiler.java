@@ -847,7 +847,6 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 	final static Method fromLongMethod = Method.getMethod("clojure.lang.Num from(long)");
 	final static Method fromDoubleMethod = Method.getMethod("clojure.lang.Num from(double)");
 
-
 	//*
 	public static void emitBoxReturn(ObjExpr objx, GeneratorAdapter gen, Class returnType){
 		if(returnType.isPrimitive())
@@ -2711,6 +2710,15 @@ public static class MetaExpr implements Expr{
 	}
 }
 
+  public static void assertNotWP(Object val) {
+    if (val != null) {
+    for (Class c: val.getClass().getInterfaces())
+      if (c.getSimpleName().equals("WatchablePromise")) {
+	  throw( new AssertionError("Using watchable promise"));
+	}
+    }
+  }
+  
 public static class IfExpr implements Expr, MaybePrimitiveExpr{
 	public final Expr testExpr;
 	public final Expr thenExpr;
@@ -2749,11 +2757,12 @@ public static class IfExpr implements Expr, MaybePrimitiveExpr{
 
 		gen.visitLineNumber(line, gen.mark());
 
-		if(testExpr instanceof StaticMethodExpr && ((StaticMethodExpr)testExpr).canEmitIntrinsicPredicate())
-			{
-			((StaticMethodExpr) testExpr).emitIntrinsicPredicate(C.EXPRESSION, objx, gen, falseLabel);
-			}
-		else if(maybePrimitiveType(testExpr) == boolean.class)
+		//if (testExpr instanceof StaticMethodExpr && ((StaticMethodExpr)testExpr).canEmitIntrinsicPredicate())
+		// 	{
+		// 	((StaticMethodExpr) testExpr).emitIntrinsicPredicate(C.EXPRESSION, objx, gen, falseLabel);
+		// 	}
+		// else
+		if (maybePrimitiveType(testExpr) == boolean.class)
 			{
 			((MaybePrimitiveExpr) testExpr).emitUnboxed(C.EXPRESSION, objx, gen);
 			gen.ifZCmp(gen.EQ, falseLabel);
@@ -2761,6 +2770,9 @@ public static class IfExpr implements Expr, MaybePrimitiveExpr{
 		else
 			{
 			testExpr.emit(C.EXPRESSION, objx, gen);
+			gen.dup();
+			gen.invokeStatic(Type.getType(Compiler.class),
+					 Method.getMethod("void assertNotWP(Object)"));
 			gen.dup();
 			gen.ifNull(nullLabel);
 			gen.getStatic(BOOLEAN_OBJECT_TYPE, "FALSE", BOOLEAN_OBJECT_TYPE);
